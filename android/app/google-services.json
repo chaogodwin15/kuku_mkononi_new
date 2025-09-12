@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "501806725488",
+    "project_id": "kuku-mkononi",
+    "storage_bucket": "kuku-mkononi.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:501806725488:android:ee00a9f2c8de997debb7b5",
+        "android_client_info": {
+          "package_name": "com.jerry.kuku_mkononi"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAPZ55Sr6c4M_1svVsctNHsiSs33KhYjlA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
