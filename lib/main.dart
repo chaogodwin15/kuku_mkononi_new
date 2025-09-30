@@ -4,6 +4,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'dart:async';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,7 +17,7 @@ class KukuMkononiApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-  return MaterialApp(
+    return MaterialApp(
       title: 'Kuku Mkononi',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(primarySwatch: Colors.green),
@@ -37,10 +38,7 @@ class AuthWrapper extends StatelessWidget {
         
         if (snapshot.hasData && snapshot.data != null) {
           return FutureBuilder<DocumentSnapshot>(
-            future: FirebaseFirestore.instance
-                .collection('users')
-                .doc(snapshot.data!.uid)
-                .get(),
+            future: _getUserDataWithRetry(snapshot.data!.uid),
             builder: (context, userSnapshot) {
               if (userSnapshot.connectionState == ConnectionState.waiting) {
                 return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -88,6 +86,27 @@ class AuthWrapper extends StatelessWidget {
         return const RoleSelectionScreen();
       },
     );
+  }
+  
+  // Retry logic for fetching user data
+  Future<DocumentSnapshot> _getUserDataWithRetry(String uid, {int maxRetries = 3}) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        return await FirebaseFirestore.instance
+            .collection('users')
+            .doc(uid)
+            .get();
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          rethrow;
+        }
+        // Wait before retrying (exponential backoff)
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
+    }
+    throw Exception('Failed to fetch user data after $maxRetries attempts');
   }
 }
 
@@ -153,6 +172,7 @@ class _AuthScreenState extends State<AuthScreen> {
   bool isLoading = false;
   String? errorMessage;
 
+  // Fixed login method with better error handling
   Future<void> loginWithPassword() async {
     if (phoneController.text.isNotEmpty && passwordController.text.isNotEmpty) {
       setState(() {
@@ -161,19 +181,39 @@ class _AuthScreenState extends State<AuthScreen> {
       });
       
       try {
+        // Use a more robust email format to avoid issues
+        final email = '${phoneController.text.trim()}@kukumkononi.com';
         await FirebaseAuth.instance.signInWithEmailAndPassword(
-          email: '${phoneController.text}@kukumkononi.com',
-          password: passwordController.text,
+          email: email,
+          password: passwordController.text.trim(),
         );
         
       } on FirebaseAuthException catch (e) {
+        String errorMsg = "Login failed";
+        if (e.code == 'user-not-found') {
+          errorMsg = "No user found with this phone number";
+        } else if (e.code == 'wrong-password') {
+          errorMsg = "Incorrect password";
+        } else if (e.code == 'invalid-email') {
+          errorMsg = "Invalid phone number format";
+        } else {
+          errorMsg = e.message ?? "Login failed";
+        }
+        
         setState(() {
-          errorMessage = e.message;
+          errorMessage = errorMsg;
         });
       } catch (e) {
-        setState(() {
-          errorMessage = "An unexpected error occurred: $e";
-        });
+        // Handle the specific PigeonUserDetails error
+        if (e.toString().contains('PigeonUserDetails')) {
+          setState(() {
+            errorMessage = "Authentication service error. Please try again.";
+          });
+        } else {
+          setState(() {
+            errorMessage = "An unexpected error occurred: ${e.toString()}";
+          });
+        }
       } finally {
         setState(() => isLoading = false);
       }
@@ -194,28 +234,26 @@ class _AuthScreenState extends State<AuthScreen> {
       });
       
       try {
+        final email = '${phoneController.text.trim()}@kukumkononi.com';
         final UserCredential userCredential = await FirebaseAuth.instance
             .createUserWithEmailAndPassword(
-              email: '${phoneController.text}@kukumkononi.com',
-              password: passwordController.text,
+              email: email,
+              password: passwordController.text.trim(),
             );
 
-        // FIXED: Added proper error handling for Firestore
+        // Save user data with retry
         try {
-          await FirebaseFirestore.instance
-              .collection('users')
-              .doc(userCredential.user!.uid)
-              .set({
-                'phone': phoneController.text,
-                'name': nameController.text,
-                'role': widget.userRole,
-                'createdAt': FieldValue.serverTimestamp(),
-              });
+          await _saveUserDataWithRetry(
+            userCredential.user!.uid,
+            phoneController.text.trim(),
+            nameController.text.trim(),
+            widget.userRole,
+          );
           
           print("User data saved to Firestore successfully!");
           
         } catch (firestoreError) {
-          print("Firestore error (user still registered in auth): $firestoreError");
+          print("Firestore error: $firestoreError");
           // User is still registered in Authentication, just Firestore failed
         }
 
@@ -225,9 +263,24 @@ class _AuthScreenState extends State<AuthScreen> {
           );
         }
       } on FirebaseAuthException catch (e) {
+        String errorMsg = "Registration failed";
+        if (e.code == 'email-already-in-use') {
+          errorMsg = "This phone number is already registered";
+        } else if (e.code == 'weak-password') {
+          errorMsg = "Password is too weak";
+        } else {
+          errorMsg = e.message ?? "Registration failed";
+        }
+        
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Registration failed: ${e.message}")),
+            SnackBar(content: Text(errorMsg)),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Registration error: ${e.toString()}")),
           );
         }
       } finally {
@@ -240,6 +293,32 @@ class _AuthScreenState extends State<AuthScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Please fill all fields")),
         );
+      }
+    }
+  }
+  
+  // Retry logic for saving user data
+  Future<void> _saveUserDataWithRetry(String uid, String phone, String name, String role, {int maxRetries = 3}) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(uid)
+            .set({
+              'phone': phone,
+              'name': name,
+              'role': role,
+              'createdAt': FieldValue.serverTimestamp(),
+            });
+        return; // Success, exit the function
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          rethrow; // Give up after max retries
+        }
+        // Wait before retrying (exponential backoff)
+        await Future.delayed(Duration(seconds: attempt * 2));
       }
     }
   }
@@ -277,19 +356,28 @@ class _AuthScreenState extends State<AuthScreen> {
                   if (!isLogin) ...[
                     TextField(
                       controller: nameController,
-                      decoration: const InputDecoration(labelText: "Full Name"),
+                      decoration: const InputDecoration(
+                        labelText: "Full Name",
+                        border: OutlineInputBorder(),
+                      ),
                     ),
                     const SizedBox(height: 10),
                   ],
                   TextField(
                     controller: phoneController,
-                    decoration: const InputDecoration(labelText: "Phone Number"),
+                    decoration: const InputDecoration(
+                      labelText: "Phone Number",
+                      border: OutlineInputBorder(),
+                    ),
                     keyboardType: TextInputType.phone,
                   ),
                   const SizedBox(height: 10),
                   TextField(
                     controller: passwordController,
-                    decoration: const InputDecoration(labelText: "Password"),
+                    decoration: const InputDecoration(
+                      labelText: "Password",
+                      border: OutlineInputBorder(),
+                    ),
                     obscureText: true,
                   ),
                   const SizedBox(height: 20),
@@ -297,8 +385,12 @@ class _AuthScreenState extends State<AuthScreen> {
                   if (isLogin) ...[
                     ElevatedButton(
                       onPressed: loginWithPassword,
+                      style: ElevatedButton.styleFrom(
+                        minimumSize: const Size(double.infinity, 50),
+                      ),
                       child: const Text("Login with Password"),
                     ),
+                    const SizedBox(height: 10),
                     TextButton(
                       onPressed: () => setState(() => isLogin = false),
                       child: const Text("New user? Register here"),
@@ -306,8 +398,12 @@ class _AuthScreenState extends State<AuthScreen> {
                   ] else ...[
                     ElevatedButton(
                       onPressed: registerUser,
+                      style: ElevatedButton.styleFrom(
+                        minimumSize: const Size(double.infinity, 50),
+                      ),
                       child: const Text("Register"),
                     ),
+                    const SizedBox(height: 10),
                     TextButton(
                       onPressed: () => setState(() => isLogin = true),
                       child: const Text("Already registered? Login here"),
@@ -346,12 +442,12 @@ class Chicken {
     final data = doc.data() as Map<String, dynamic>;
     return Chicken(
       id: doc.id,
-      sellerId: data['sellerId'],
-      sellerName: data['sellerName'],
-      type: data['type'],
-      price: data['price'].toDouble(),
-      quantity: data['quantity'],
-      description: data['description'],
+      sellerId: data['sellerId'] ?? '',
+      sellerName: data['sellerName'] ?? '',
+      type: data['type'] ?? '',
+      price: (data['price'] ?? 0.0).toDouble(),
+      quantity: data['quantity'] ?? 0,
+      description: data['description'] ?? '',
       createdAt: (data['createdAt'] as Timestamp).toDate(),
     );
   }
@@ -389,15 +485,15 @@ class Order {
     final data = doc.data() as Map<String, dynamic>;
     return Order(
       id: doc.id,
-      buyerId: data['buyerId'],
-      buyerName: data['buyerName'],
-      sellerId: data['sellerId'],
-      sellerName: data['sellerName'],
-      chickenId: data['chickenId'],
-      chickenType: data['chickenType'],
-      quantity: data['quantity'],
-      totalPrice: data['totalPrice'].toDouble(),
-      status: data['status'],
+      buyerId: data['buyerId'] ?? '',
+      buyerName: data['buyerName'] ?? '',
+      sellerId: data['sellerId'] ?? '',
+      sellerName: data['sellerName'] ?? '',
+      chickenId: data['chickenId'] ?? '',
+      chickenType: data['chickenType'] ?? '',
+      quantity: data['quantity'] ?? 0,
+      totalPrice: (data['totalPrice'] ?? 0.0).toDouble(),
+      status: data['status'] ?? 'pending',
       createdAt: (data['createdAt'] as Timestamp).toDate(),
     );
   }
@@ -424,20 +520,16 @@ class _AddChickenScreenState extends State<AddChickenScreen> {
       setState(() => _isLoading = true);
       try {
         final user = FirebaseAuth.instance.currentUser;
-        final userDoc = await FirebaseFirestore.instance
-            .collection('users')
-            .doc(user!.uid)
-            .get();
+        final userDoc = await _getUserDataWithRetry(user!.uid);
 
-        await FirebaseFirestore.instance.collection('chickens').add({
-          'sellerId': user.uid,
-          'sellerName': userDoc['name'],
-          'type': _typeController.text,
-          'price': double.parse(_priceController.text),
-          'quantity': int.parse(_quantityController.text),
-          'description': _descriptionController.text,
-          'createdAt': FieldValue.serverTimestamp(),
-        });
+        await _saveChickenWithRetry(
+          user.uid,
+          userDoc['name'],
+          _typeController.text.trim(),
+          double.parse(_priceController.text.trim()),
+          int.parse(_quantityController.text.trim()),
+          _descriptionController.text.trim(),
+        );
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -458,6 +550,59 @@ class _AddChickenScreenState extends State<AddChickenScreen> {
       }
     }
   }
+  
+  // Retry logic for getting user data
+  Future<DocumentSnapshot> _getUserDataWithRetry(String uid, {int maxRetries = 3}) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        return await FirebaseFirestore.instance
+            .collection('users')
+            .doc(uid)
+            .get();
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          rethrow;
+        }
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
+    }
+    throw Exception('Failed to fetch user data after $maxRetries attempts');
+  }
+  
+  // Retry logic for saving chicken data
+  Future<void> _saveChickenWithRetry(
+    String sellerId, 
+    String sellerName, 
+    String type, 
+    double price, 
+    int quantity, 
+    String description,
+    {int maxRetries = 3}
+  ) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        await FirebaseFirestore.instance.collection('chickens').add({
+          'sellerId': sellerId,
+          'sellerName': sellerName,
+          'type': type,
+          'price': price,
+          'quantity': quantity,
+          'description': description,
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+        return; // Success, exit the function
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          rethrow; // Give up after max retries
+        }
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -473,29 +618,47 @@ class _AddChickenScreenState extends State<AddChickenScreen> {
             children: [
               TextFormField(
                 controller: _typeController,
-                decoration: const InputDecoration(labelText: "Chicken Type"),
+                decoration: const InputDecoration(
+                  labelText: "Chicken Type",
+                  border: OutlineInputBorder(),
+                ),
                 validator: (value) => value!.isEmpty ? 'Required' : null,
               ),
+              const SizedBox(height: 10),
               TextFormField(
                 controller: _priceController,
-                decoration: const InputDecoration(labelText: "Price per Chicken"),
+                decoration: const InputDecoration(
+                  labelText: "Price per Chicken",
+                  border: OutlineInputBorder(),
+                ),
                 keyboardType: TextInputType.number,
                 validator: (value) => value!.isEmpty ? 'Required' : null,
               ),
+              const SizedBox(height: 10),
               TextFormField(
                 controller: _quantityController,
-                decoration: const InputDecoration(labelText: "Quantity Available"),
+                decoration: const InputDecoration(
+                  labelText: "Quantity Available",
+                  border: OutlineInputBorder(),
+                ),
                 keyboardType: TextInputType.number,
                 validator: (value) => value!.isEmpty ? 'Required' : null,
               ),
+              const SizedBox(height: 10),
               TextFormField(
                 controller: _descriptionController,
-                decoration: const InputDecoration(labelText: "Description"),
+                decoration: const InputDecoration(
+                  labelText: "Description",
+                  border: OutlineInputBorder(),
+                ),
                 maxLines: 3,
               ),
               const SizedBox(height: 20),
               ElevatedButton(
                 onPressed: _addChicken,
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 50),
+                ),
                 child: const Text("Add Chicken"),
               ),
             ],
@@ -537,7 +700,7 @@ class ViewChickensScreen extends StatelessWidget {
               return Card(
                 margin: const EdgeInsets.all(8.0),
                 child: ListTile(
-                  title: Text(chicken.type),
+                  title: Text(chicken.type, style: const TextStyle(fontWeight: FontWeight.bold)),
                   subtitle: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -586,7 +749,7 @@ class _PlaceOrderScreenState extends State<PlaceOrderScreen> {
   Future<void> _placeOrder() async {
     if (_quantityController.text.isEmpty) return;
     
-    final quantity = int.parse(_quantityController.text);
+    final quantity = int.tryParse(_quantityController.text) ?? 0;
     if (quantity <= 0 || quantity > widget.chicken.quantity) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -599,34 +762,18 @@ class _PlaceOrderScreenState extends State<PlaceOrderScreen> {
     setState(() => _isLoading = true);
     try {
       final user = FirebaseAuth.instance.currentUser!;
-      final userDoc = await FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .get();
+      final userDoc = await _getUserDataWithRetry(user.uid);
 
       final totalPrice = quantity * widget.chicken.price;
 
-      // Create order
-      await FirebaseFirestore.instance.collection('orders').add({
-        'buyerId': user.uid,
-        'buyerName': userDoc['name'],
-        'sellerId': widget.chicken.sellerId,
-        'sellerName': widget.chicken.sellerName,
-        'chickenId': widget.chicken.id,
-        'chickenType': widget.chicken.type,
-        'quantity': quantity,
-        'totalPrice': totalPrice,
-        'status': 'pending',
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-
-      // Update chicken quantity
-      await FirebaseFirestore.instance
-          .collection('chickens')
-          .doc(widget.chicken.id)
-          .update({
-            'quantity': widget.chicken.quantity - quantity,
-          });
+      // Create order and update chicken quantity with retry logic
+      await _processOrderWithRetry(
+        user.uid,
+        userDoc['name'],
+        widget.chicken,
+        quantity,
+        totalPrice,
+      );
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -646,9 +793,77 @@ class _PlaceOrderScreenState extends State<PlaceOrderScreen> {
       }
     }
   }
+  
+  // Retry logic for getting user data
+  Future<DocumentSnapshot> _getUserDataWithRetry(String uid, {int maxRetries = 3}) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        return await FirebaseFirestore.instance
+            .collection('users')
+            .doc(uid)
+            .get();
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          rethrow;
+        }
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
+    }
+    throw Exception('Failed to fetch user data after $maxRetries attempts');
+  }
+  
+  // Retry logic for processing order
+  Future<void> _processOrderWithRetry(
+    String buyerId,
+    String buyerName,
+    Chicken chicken,
+    int quantity,
+    double totalPrice,
+    {int maxRetries = 3}
+  ) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        // Create order
+        await FirebaseFirestore.instance.collection('orders').add({
+          'buyerId': buyerId,
+          'buyerName': buyerName,
+          'sellerId': chicken.sellerId,
+          'sellerName': chicken.sellerName,
+          'chickenId': chicken.id,
+          'chickenType': chicken.type,
+          'quantity': quantity,
+          'totalPrice': totalPrice,
+          'status': 'pending',
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+
+        // Update chicken quantity
+        await FirebaseFirestore.instance
+            .collection('chickens')
+            .doc(chicken.id)
+            .update({
+              'quantity': chicken.quantity - quantity,
+            });
+            
+        return; // Success, exit the function
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          rethrow; // Give up after max retries
+        }
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
+    final quantity = int.tryParse(_quantityController.text) ?? 0;
+    final totalPrice = quantity * widget.chicken.price;
+
     return Scaffold(
       appBar: AppBar(title: const Text("Place Order")),
       body: _isLoading
@@ -658,9 +873,11 @@ class _PlaceOrderScreenState extends State<PlaceOrderScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text("Chicken Type: ${widget.chicken.type}", style: const TextStyle(fontSize: 18)),
+            Text("Chicken Type: ${widget.chicken.type}", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
             Text("Price per Chicken: TZS ${widget.chicken.price.toStringAsFixed(2)}"),
             Text("Available: ${widget.chicken.quantity}"),
+            Text("Seller: ${widget.chicken.sellerName}"),
             const SizedBox(height: 20),
             TextField(
               controller: _quantityController,
@@ -676,12 +893,15 @@ class _PlaceOrderScreenState extends State<PlaceOrderScreen> {
             const SizedBox(height: 20),
             if (_quantityController.text.isNotEmpty)
               Text(
-                "Total Price: TZS ${(int.tryParse(_quantityController.text) ?? 0) * widget.chicken.price}",
+                "Total Price: TZS ${totalPrice.toStringAsFixed(2)}",
                 style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
             const SizedBox(height: 20),
             ElevatedButton(
               onPressed: _placeOrder,
+              style: ElevatedButton.styleFrom(
+                minimumSize: const Size(double.infinity, 50),
+              ),
               child: const Text("Place Order"),
             ),
           ],
@@ -706,7 +926,7 @@ class MyOrdersScreen extends StatelessWidget {
         : collection.where('sellerId', isEqualTo: user.uid);
 
     return Scaffold(
-      appBar: AppBar(title: Text("My Orders")),
+      appBar: AppBar(title: Text("${userRole.capitalize()} Orders")),
       body: StreamBuilder<QuerySnapshot>(
         stream: query.orderBy('createdAt', descending: true).snapshots(),
         builder: (context, snapshot) {
@@ -726,13 +946,13 @@ class MyOrdersScreen extends StatelessWidget {
               return Card(
                 margin: const EdgeInsets.all(8.0),
                 child: ListTile(
-                  title: Text(order.chickenType),
+                  title: Text(order.chickenType, style: const TextStyle(fontWeight: FontWeight.bold)),
                   subtitle: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text("Quantity: ${order.quantity}"),
                       Text("Total: TZS ${order.totalPrice.toStringAsFixed(2)}"),
-                      Text("Status: ${order.status}"),
+                      Text("Status: ${order.status.toUpperCase()}"),
                       Text("Date: ${order.createdAt.toString().split(' ')[0]}"),
                       if (userRole == 'buyer')
                         Text("Seller: ${order.sellerName}"),
@@ -742,7 +962,7 @@ class MyOrdersScreen extends StatelessWidget {
                   ),
                   trailing: userRole == 'seller' && order.status == 'pending'
                       ? ElevatedButton(
-                          onPressed: () => _confirmOrder(order.id),
+                          onPressed: () => _confirmOrderWithRetry(order.id),
                           child: const Text("Confirm"),
                         )
                       : null,
@@ -755,14 +975,23 @@ class MyOrdersScreen extends StatelessWidget {
     );
   }
 
-  Future<void> _confirmOrder(String orderId) async {
-    try {
-      await FirebaseFirestore.instance
-          .collection('orders')
-          .doc(orderId)
-          .update({'status': 'confirmed'});
-    } catch (e) {
-      print("Error confirming order: $e");
+  Future<void> _confirmOrderWithRetry(String orderId, {int maxRetries = 3}) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        await FirebaseFirestore.instance
+            .collection('orders')
+            .doc(orderId)
+            .update({'status': 'confirmed'});
+        return; // Success, exit the function
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          print("Error confirming order after $maxRetries attempts: $e");
+          return; // Don't throw, just log the error
+        }
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
     }
   }
 }
@@ -809,7 +1038,7 @@ class MyChickensScreen extends StatelessWidget {
               return Card(
                 margin: const EdgeInsets.all(8.0),
                 child: ListTile(
-                  title: Text(chicken.type),
+                  title: Text(chicken.type, style: const TextStyle(fontWeight: FontWeight.bold)),
                   subtitle: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -820,8 +1049,8 @@ class MyChickensScreen extends StatelessWidget {
                     ],
                   ),
                   trailing: IconButton(
-                    icon: const Icon(Icons.delete),
-                    onPressed: () => _deleteChicken(chicken.id),
+                    icon: const Icon(Icons.delete, color: Colors.red),
+                    onPressed: () => _deleteChickenWithRetry(chicken.id),
                   ),
                 ),
               );
@@ -832,14 +1061,23 @@ class MyChickensScreen extends StatelessWidget {
     );
   }
 
-  Future<void> _deleteChicken(String chickenId) async {
-    try {
-      await FirebaseFirestore.instance
-          .collection('chickens')
-          .doc(chickenId)
-          .delete();
-    } catch (e) {
-      print("Error deleting chicken: $e");
+  Future<void> _deleteChickenWithRetry(String chickenId, {int maxRetries = 3}) async {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        await FirebaseFirestore.instance
+            .collection('chickens')
+            .doc(chickenId)
+            .delete();
+        return; // Success, exit the function
+      } catch (e) {
+        attempt++;
+        if (attempt >= maxRetries) {
+          print("Error deleting chicken after $maxRetries attempts: $e");
+          return; // Don't throw, just log the error
+        }
+        await Future.delayed(Duration(seconds: attempt * 2));
+      }
     }
   }
 }
@@ -915,8 +1153,8 @@ class DashboardScreen extends StatelessWidget {
         title: Text("${userRole.capitalize()} Dashboard"),
         actions: [
           IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: () {},
+            icon: const Icon(Icons.logout),
+            onPressed: () => _logout(context),
           ),
         ],
       ),
@@ -939,7 +1177,12 @@ class DashboardScreen extends StatelessWidget {
       _buildDashboardItem(
         icon: Icons.shopping_cart,
         title: "My Cart",
-        onTap: () {},
+        onTap: () {
+          // TODO: Implement cart functionality
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Cart feature coming soon!")),
+          );
+        },
       ),
       _buildDashboardItem(
         icon: Icons.list_alt,
